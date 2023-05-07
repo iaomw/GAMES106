@@ -17,6 +17,14 @@
  * If you are looking for a complete glTF implementation, check out https://github.com/SaschaWillems/Vulkan-glTF-PBR/
  */
 
+#include "glm/detail/type_mat.hpp"
+#include "glm/fwd.hpp"
+#include "glm/gtc/matrix_transform.hpp"
+#include "glm/gtc/quaternion.hpp"
+#include <vcruntime_string.h>
+#include <vector>
+#include <thread>
+
 #define TINYGLTF_IMPLEMENTATION
 #define STB_IMAGE_IMPLEMENTATION
 #define TINYGLTF_NO_STB_IMAGE_WRITE
@@ -70,6 +78,10 @@ public:
 		int32_t materialIndex;
 	};
 
+	std::vector<
+		std::function<void(float)>
+	> animationCallbacks;
+
 	// Contains the node's (optional) geometry and can be made up of an arbitrary number of primitives
 	struct Mesh {
 		std::vector<Primitive> primitives;
@@ -77,16 +89,63 @@ public:
 
 	// A node represents an object in the glTF scene graph
 	struct Node {
+		uint32_t index;
 		Node* parent;
-		std::vector<Node*> children;
 		Mesh mesh;
-		glm::mat4 matrix;
+
+		std::vector<Node*> children;
+
+		glm::mat4 defaultMatrix = glm::mat4(1.0f);
+
+		glm::vec3 translation = glm::vec3(0.0f);
+		glm::quat rotation {1,0,0,0};
+		glm::vec3 scale {1, 1, 1};
+
+		glm::mat4 animatedMatrix() {
+			glm::mat4 result_mat = glm::mat4(rotation) * glm::scale(glm::mat4(1.0f), scale) * defaultMatrix;
+			result_mat = glm::translate(glm::mat4(1.0f), translation) * result_mat;
+			return result_mat;
+		};
+
 		~Node() {
 			for (auto& child : children) {
 				delete child;
 			}
 		}
 	};
+
+	
+	Node* findNode(Node *parent, uint32_t index)
+	{
+		Node *nodeFound = nullptr;
+		if (parent->index == index)
+		{
+			return parent;
+		}
+		for (auto &child : parent->children)
+		{
+			nodeFound = findNode(child, index);
+			if (nodeFound)
+			{
+				break;
+			}
+		}
+		return nodeFound;
+	}
+
+	Node* nodeFromIndex(uint32_t index)
+	{
+		Node *nodeFound = nullptr;
+		for (auto &node : nodes)
+		{
+			nodeFound = findNode(node, index);
+			if (nodeFound)
+			{
+				break;
+			}
+		}
+		return nodeFound;
+	}
 
 	// A glTF material stores information in e.g. the texture that is attached to it and colors
 	struct Material {
@@ -201,32 +260,34 @@ public:
 		}
 	}
 
-	void loadNode(const tinygltf::Node& inputNode, const tinygltf::Model& input, VulkanglTFModel::Node* parent, std::vector<uint32_t>& indexBuffer, std::vector<VulkanglTFModel::Vertex>& vertexBuffer)
+	void loadNode(const tinygltf::Node& inputNode, const int nodeIdx, const tinygltf::Model& input, VulkanglTFModel::Node* parent, std::vector<uint32_t>& indexBuffer, std::vector<VulkanglTFModel::Vertex>& vertexBuffer)
 	{
 		VulkanglTFModel::Node* node = new VulkanglTFModel::Node{};
-		node->matrix = glm::mat4(1.0f);
+		node->defaultMatrix = glm::mat4(1.0f);
 		node->parent = parent;
+		node->index = nodeIdx;
 
 		// Get the local node matrix
 		// It's either made up from translation, rotation, scale or a 4x4 matrix
 		if (inputNode.translation.size() == 3) {
-			node->matrix = glm::translate(node->matrix, glm::vec3(glm::make_vec3(inputNode.translation.data())));
+			node->translation = glm::make_vec3(inputNode.translation.data());
 		}
 		if (inputNode.rotation.size() == 4) {
 			glm::quat q = glm::make_quat(inputNode.rotation.data());
-			node->matrix *= glm::mat4(q);
+			node->rotation = q;
 		}
 		if (inputNode.scale.size() == 3) {
-			node->matrix = glm::scale(node->matrix, glm::vec3(glm::make_vec3(inputNode.scale.data())));
+			node->scale = glm::make_vec3(inputNode.scale.data());
 		}
 		if (inputNode.matrix.size() == 16) {
-			node->matrix = glm::make_mat4x4(inputNode.matrix.data());
+			node->defaultMatrix = glm::make_mat4x4(inputNode.matrix.data());
 		};
 
 		// Load node's children
 		if (inputNode.children.size() > 0) {
 			for (size_t i = 0; i < inputNode.children.size(); i++) {
-				loadNode(input.nodes[inputNode.children[i]], input , node, indexBuffer, vertexBuffer);
+				auto nodeIdx = inputNode.children[i];
+				loadNode(input.nodes[inputNode.children[i]], nodeIdx, input , node, indexBuffer, vertexBuffer);
 			}
 		}
 
@@ -340,10 +401,12 @@ public:
 		if (node->mesh.primitives.size() > 0) {
 			// Pass the node's matrix via push constants
 			// Traverse the node hierarchy to the top-most parent to get the final matrix of the current node
-			glm::mat4 nodeMatrix = node->matrix;
+			glm::mat4 nodeMatrix = node->animatedMatrix();
+			//glm::mat4 nodeMatrix = node->matrix;
 			VulkanglTFModel::Node* currentParent = node->parent;
 			while (currentParent) {
-				nodeMatrix = currentParent->matrix * nodeMatrix;
+				nodeMatrix = currentParent->animatedMatrix() * nodeMatrix;
+				//nodeMatrix = currentParent->matrix * nodeMatrix;
 				currentParent = currentParent->parent;
 			}
 			// Pass the final matrix to the vertex shader using push constants
@@ -366,6 +429,20 @@ public:
 	// Draw the glTF scene starting at the top-level-nodes
 	void draw(VkCommandBuffer commandBuffer, VkPipelineLayout pipelineLayout)
 	{
+		const static auto launch_time = std::chrono::system_clock::now(); 
+
+		auto current_time = std::chrono::system_clock::now();
+		std::chrono::duration<float> elapsed_seconds = current_time - launch_time;
+		auto delta = elapsed_seconds.count();
+
+		for(auto& anim : animationCallbacks) {
+
+			// auto td = std::thread([&] {
+			// 	anim(delta);
+    		// });
+			// td.join();
+			anim(delta);
+		}
 		// All vertices and indices are stored in single buffers, so we only need to bind once
 		VkDeviceSize offsets[1] = { 0 };
 		vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertices.buffer, offsets);
@@ -507,14 +584,153 @@ public:
 			glTFModel.loadMaterials(glTFInput);
 			glTFModel.loadTextures(glTFInput);
 			const tinygltf::Scene& scene = glTFInput.scenes[0];
+
+			glTFInput.buffers[0].uri;
+			glTFInput.bufferViews;
+
+			glTFInput.animations;
+
 			for (size_t i = 0; i < scene.nodes.size(); i++) {
 				const tinygltf::Node node = glTFInput.nodes[scene.nodes[i]];
-				glTFModel.loadNode(node, glTFInput, nullptr, indexBuffer, vertexBuffer);
+				auto nodeIdx = scene.nodes[i];
+
+				glTFModel.loadNode(node, nodeIdx, glTFInput, nullptr, indexBuffer, vertexBuffer);
 			}
+
+			
 		}
 		else {
 			vks::tools::exitFatal("Could not open the glTF file.\n\nThe file is part of the additional asset pack.\n\nRun \"download_assets.py\" in the repository root to download the latest version.", -1);
 			return;
+		}
+
+		for (auto& anim : glTFInput.animations) {
+
+			for (auto& channel : anim.channels) {
+
+				const auto& sampler = anim.samplers[channel.sampler];
+
+				const auto input_accessor = glTFInput.accessors[sampler.input];
+				const auto output_accessor = glTFInput.accessors[sampler.output];
+
+				const auto input_element_count = input_accessor.count;
+				const auto input_element_float_count = tinygltf::GetNumComponentsInType(input_accessor.type);
+				const auto input_byte_count = input_element_float_count * sizeof(float) * input_element_count;
+
+				std::vector<float> _input_data_copy_(input_element_float_count * input_element_count);
+				{
+					auto& input_bufferView = glTFInput.bufferViews[input_accessor.bufferView];
+					auto& input_buffer = glTFInput.buffers[input_bufferView.buffer];
+
+					auto byte_offset = input_accessor.byteOffset + input_bufferView.byteOffset; 
+					auto input_data_ptr = input_buffer.data.data();
+
+					memcpy(_input_data_copy_.data(), input_data_ptr+byte_offset, input_byte_count);
+				}
+				
+				const auto output_element_count = output_accessor.count;
+				const auto output_element_float_count = tinygltf::GetNumComponentsInType(output_accessor.type);
+				const auto output_byte_count = output_element_float_count * sizeof(float) * output_element_count;
+
+				std::vector<float> _output_data_copy_(output_element_float_count * output_element_count); 
+				{
+					auto& output_bufferView = glTFInput.bufferViews[output_accessor.bufferView];
+					auto& output_buffer = glTFInput.buffers[output_bufferView.buffer];
+
+					auto byte_offset = output_accessor.byteOffset + output_bufferView.byteOffset; 
+					auto output_data_ptr = output_buffer.data.data();
+
+					memcpy(_output_data_copy_.data(), output_data_ptr+byte_offset, output_byte_count);
+				}
+
+				float input_min_value = (float)input_accessor.minValues[0];
+				float input_max_value = (float)input_accessor.maxValues[0];
+
+				auto run_animation = [=](float render_time) {
+
+					//if (render_time > input_max_value) { return; }
+					float current_t = fmod(render_time, input_max_value);
+					if (current_t < input_min_value) { return; }
+
+					for(size_t i=0; i<_input_data_copy_.size()-1; ++i) {
+
+						if (current_t >= _input_data_copy_[i] && current_t < _input_data_copy_[i+1]) {
+
+							float delta = current_t - _input_data_copy_[i];
+							float ratio = delta / (_input_data_copy_[i+1]-_input_data_copy_[i]);
+
+							if (channel.target_path == "translation") {
+
+								assert(output_element_float_count == 3);
+
+								glm::vec3 previous_trans ( 
+									_output_data_copy_[i * output_element_float_count ],
+									_output_data_copy_[i * output_element_float_count + 1],
+									_output_data_copy_[i * output_element_float_count + 2]
+								);
+
+								glm::vec3 next_trans (
+									_output_data_copy_[(i+1) * output_element_float_count ],
+									_output_data_copy_[(i+1) * output_element_float_count + 1],
+									_output_data_copy_[(i+1) * output_element_float_count + 2]
+								);
+
+								glm::vec3 final_trans = glm::mix(previous_trans, next_trans, ratio);
+
+								auto node_ptr = glTFModel.nodeFromIndex(channel.target_node);
+								node_ptr->translation = final_trans;  
+
+							} else if (channel.target_path == "scale") {
+
+								assert(output_element_float_count == 3);
+
+								glm::vec3 previous_scale ( 
+									_output_data_copy_[i * output_element_float_count ],
+									_output_data_copy_[i * output_element_float_count + 1],
+									_output_data_copy_[i * output_element_float_count + 2]
+								);
+
+								glm::vec3 next_scale (
+									_output_data_copy_[(i+1) * output_element_float_count ],
+									_output_data_copy_[(i+1) * output_element_float_count + 1],
+									_output_data_copy_[(i+1) * output_element_float_count + 2]
+								);
+
+								glm::vec3 final_scale = glm::mix(previous_scale, next_scale, ratio);
+
+								auto node_ptr = glTFModel.nodeFromIndex(channel.target_node);
+								node_ptr->scale = final_scale;
+
+							} else if (channel.target_path == "rotation") {
+
+								assert(output_element_float_count == 4);
+
+								glm::quat q1;
+									q1.x = _output_data_copy_[i * output_element_float_count ];
+									q1.y = _output_data_copy_[i * output_element_float_count + 1];
+									q1.z = _output_data_copy_[i * output_element_float_count + 2];
+									q1.w = _output_data_copy_[i * output_element_float_count + 3];
+								
+								glm::quat q2;
+									q2.x = _output_data_copy_[(i+1) * output_element_float_count ];
+									q2.y = _output_data_copy_[(i+1) * output_element_float_count + 1];
+									q2.z = _output_data_copy_[(i+1) * output_element_float_count + 2];
+									q2.w = _output_data_copy_[(i+1) * output_element_float_count + 3];
+
+								glm::quat q3 = glm::normalize(glm::slerp(q1, q2, ratio));
+
+								auto node_ptr = glTFModel.nodeFromIndex(channel.target_node);
+								node_ptr->rotation = q3;
+							} 
+							break;
+						}
+					}
+				}; // run_animation
+				
+				glTFModel.animationCallbacks.push_back(
+					run_animation
+				);
+			}
 		}
 
 		// Create and upload vertex and index buffer
@@ -592,7 +808,7 @@ public:
 
 	void loadAssets()
 	{
-		loadglTFFile(getAssetPath() + "models/FlightHelmet/glTF/FlightHelmet.gltf");
+		loadglTFFile(getAssetPath() + "models/buster_drone/busterDrone.gltf");
 	}
 
 	void setupDescriptors()
@@ -738,6 +954,7 @@ public:
 		if (camera.updated) {
 			updateUniformBuffers();
 		}
+		buildCommandBuffers();
 	}
 
 	virtual void viewChanged()
