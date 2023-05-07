@@ -808,7 +808,7 @@ public:
 
 	void loadAssets()
 	{
-		loadglTFFile(getAssetPath() + "models/buster_drone/busterDrone.gltf");
+		loadglTFFile(getAssetPath() + "buster_drone/busterDrone.gltf");
 	}
 
 	void setupDescriptors()
