@@ -27,6 +27,22 @@ function(buildHomework HOMEWORK_NAME)
 	file(GLOB SHADERS_HLSL "${SHADER_DIR_HLSL}/*.vert" "${SHADER_DIR_HLSL}/*.frag" "${SHADER_DIR_HLSL}/*.comp" "${SHADER_DIR_HLSL}/*.geom" "${SHADER_DIR_HLSL}/*.tesc" "${SHADER_DIR_HLSL}/*.tese" "${SHADER_DIR_HLSL}/*.mesh" "${SHADER_DIR_HLSL}/*.task" "${SHADER_DIR_HLSL}/*.rgen" "${SHADER_DIR_HLSL}/*.rchit" "${SHADER_DIR_HLSL}/*.rmiss" "${SHADER_DIR_HLSL}/*.rcall")
 	source_group("Shaders\\GLSL" FILES ${SHADERS_GLSL})
 	source_group("Shaders\\HLSL" FILES ${SHADERS_HLSL})
+
+	set(GLSLC "glslc")
+
+	foreach(SHADER IN LISTS SHADERS_GLSL)
+    	get_filename_component(FILENAME ${SHADER} NAME)
+		get_filename_component(FILEPATH ${SHADER} DIRECTORY)
+
+    	add_custom_command(OUTPUT ${FILEPATH}/${FILENAME}.spv
+        	COMMAND ${GLSLC} ${SHADER} -o ${FILEPATH}/${FILENAME}.spv
+        	DEPENDS ${SHADER}
+        	COMMENT "Compiling ${FILENAME}")
+	list(APPEND SPV_SHADERS ${FILEPATH}/${FILENAME}.spv)
+	endForeach()
+
+	add_custom_target(${HOMEWORK_NAME}_SHADERS ALL DEPENDS ${SPV_SHADERS})
+
 	# Add optional readme / tutorial
 	file(GLOB README_FILES "${HOMEWORK_FOLDER}/*.md")
 	if(WIN32)
@@ -36,6 +52,8 @@ function(buildHomework HOMEWORK_NAME)
 		add_executable(${HOMEWORK_NAME} ${MAIN_CPP} ${SOURCE} ${MAIN_HEADER} ${SHADERS_GLSL} ${SHADERS_HLSL} ${README_FILES})
 		target_link_libraries(${HOMEWORK_NAME} base )
 	endif(WIN32)
+
+	add_dependencies(${HOMEWORK_NAME} ${HOMEWORK_NAME}_SHADERS)
 
 	set_target_properties(${HOMEWORK_NAME} PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 	if(${HOMEWORK_NAME} STREQUAL "texture3d")
