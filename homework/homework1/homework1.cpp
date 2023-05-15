@@ -17,14 +17,6 @@
  * If you are looking for a complete glTF implementation, check out https://github.com/SaschaWillems/Vulkan-glTF-PBR/
  */
 
-#include "glm/detail/type_mat.hpp"
-#include "glm/fwd.hpp"
-#include "glm/gtc/matrix_transform.hpp"
-#include "glm/gtc/quaternion.hpp"
-#include <vcruntime_string.h>
-#include <vector>
-#include <thread>
-
 #define TINYGLTF_IMPLEMENTATION
 #define STB_IMAGE_IMPLEMENTATION
 #define TINYGLTF_NO_STB_IMAGE_WRITE
@@ -51,7 +43,8 @@ public:
 		glm::vec3 pos;
 		glm::vec3 normal;
 		glm::vec2 uv;
-		glm::vec3 color;
+		glm::vec4 color;
+		glm::vec4 tangent;
 	};
 
 	// Single vertex buffer for all primitives
@@ -149,8 +142,20 @@ public:
 
 	// A glTF material stores information in e.g. the texture that is attached to it and colors
 	struct Material {
+		int baseColorTextureIndex = -1;
 		glm::vec4 baseColorFactor = glm::vec4(1.0f);
-		uint32_t baseColorTextureIndex;
+		
+		int metallicRoughnessTextureIndex = -1;
+		float metalicFactor = 1.0f;
+		float roughnessFactor = 1.0f;
+
+		int normalTexureIndex = -1;
+		int occlusionTextureIndex = -1;
+
+		int emissiveTextureIndex = -1;
+		glm::vec3 emissiveFactor = glm::vec3(1.0f);
+
+		VkDescriptorSet descriptorSet;
 	};
 
 	// Contains the texture for a single glTF image
@@ -257,6 +262,21 @@ public:
 			if (glTFMaterial.values.find("baseColorTexture") != glTFMaterial.values.end()) {
 				materials[i].baseColorTextureIndex = glTFMaterial.values["baseColorTexture"].TextureIndex();
 			}
+
+			//"metallicFactor", "roughnessFactor", "emissiveFactor"
+			materials[i].baseColorTextureIndex = glTFMaterial.pbrMetallicRoughness.baseColorTexture.index;
+			materials[i].metallicRoughnessTextureIndex = glTFMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index;
+			materials[i].normalTexureIndex = glTFMaterial.normalTexture.index;
+			materials[i].emissiveTextureIndex = glTFMaterial.emissiveTexture.index;
+			materials[i].occlusionTextureIndex = glTFMaterial.occlusionTexture.index;
+
+			std::cout << "emissive =" << glTFMaterial.emissiveFactor[0] << std::endl;
+
+			assert(materials[i].metallicRoughnessTextureIndex != -1);
+			assert(materials[i].baseColorTextureIndex != -1);
+			assert(materials[i].normalTexureIndex != -1);
+			//assert(materials[i].emissiveTextureIndex != -1);
+			//assert(materials[i].occlusionTextureIndex != -1);
 		}
 	}
 
@@ -306,6 +326,7 @@ public:
 					const float* positionBuffer = nullptr;
 					const float* normalsBuffer = nullptr;
 					const float* texCoordsBuffer = nullptr;
+					const float* tangentBuffer = nullptr;
 					size_t vertexCount = 0;
 
 					// Get buffer data for vertex positions
@@ -329,13 +350,20 @@ public:
 						texCoordsBuffer = reinterpret_cast<const float*>(&(input.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
 					}
 
+					if (glTFPrimitive.attributes.find("TANGENT") != glTFPrimitive.attributes.end()) {
+						const tinygltf::Accessor& accessor = input.accessors[glTFPrimitive.attributes.find("TANGENT")->second];
+						const tinygltf::BufferView& view = input.bufferViews[accessor.bufferView];
+						tangentBuffer = reinterpret_cast<const float*>(&(input.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
+					}
+
 					// Append data to model's vertex buffer
 					for (size_t v = 0; v < vertexCount; v++) {
 						Vertex vert{};
 						vert.pos = glm::vec4(glm::make_vec3(&positionBuffer[v * 3]), 1.0f);
 						vert.normal = glm::normalize(glm::vec3(normalsBuffer ? glm::make_vec3(&normalsBuffer[v * 3]) : glm::vec3(0.0f)));
 						vert.uv = texCoordsBuffer ? glm::make_vec2(&texCoordsBuffer[v * 2]) : glm::vec3(0.0f);
-						vert.color = glm::vec3(1.0f);
+						vert.color = glm::vec4(1.0f);
+						vert.tangent = tangentBuffer ? glm::make_vec4(&tangentBuffer[v*4]) : glm::vec4(0.0f);
 						vertexBuffer.push_back(vert);
 					}
 				}
@@ -409,14 +437,19 @@ public:
 				//nodeMatrix = currentParent->matrix * nodeMatrix;
 				currentParent = currentParent->parent;
 			}
+
+			glm::mat4 normalMatrix = glm::transpose(glm::inverse(nodeMatrix));
+			glm::mat4 twoMatirx[2] = {nodeMatrix, normalMatrix};
+
 			// Pass the final matrix to the vertex shader using push constants
-			vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &nodeMatrix);
+			vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 2 * sizeof(glm::mat4), &twoMatirx[0]);
+
 			for (VulkanglTFModel::Primitive& primitive : node->mesh.primitives) {
 				if (primitive.indexCount > 0) {
 					// Get the texture index for this primitive
-					VulkanglTFModel::Texture texture = textures[materials[primitive.materialIndex].baseColorTextureIndex];
 					// Bind the descriptor for the current primitive's texture
-					vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 1, 1, &images[texture.imageIndex].descriptorSet, 0, nullptr);
+					auto& material = materials[primitive.materialIndex];
+					vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 1, 1, &material.descriptorSet, 0, nullptr);
 					vkCmdDrawIndexed(commandBuffer, primitive.indexCount, 1, primitive.firstIndex, 0, 0);
 				}
 			}
@@ -435,14 +468,25 @@ public:
 		std::chrono::duration<float> elapsed_seconds = current_time - launch_time;
 		auto delta = elapsed_seconds.count();
 
-		for(auto& anim : animationCallbacks) {
+		auto thread_count = 2u;//std::thread::hardware_concurrency();
+		auto task_count = animationCallbacks.size();
 
-			// auto td = std::thread([&] {
-			// 	anim(delta);
-    		// });
-			// td.join();
-			anim(delta);
+		auto bin_size = task_count / thread_count;
+		auto bin_rema = task_count % thread_count;
+		
+		std::vector<size_t> bins(thread_count, bin_size);
+		bins.back() += bin_rema;
+
+		for(size_t i=0; i<bins.size(); ++i) {
+			
+			//std::thread([=]{
+				for(size_t j=0; j<bins[i]; ++j) {
+					size_t idx = bin_size * i + j;
+					animationCallbacks[idx](delta);
+				}
+			//}).join();
 		}
+
 		// All vertices and indices are stored in single buffers, so we only need to bind once
 		VkDeviceSize offsets[1] = { 0 };
 		vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertices.buffer, offsets);
@@ -461,6 +505,9 @@ public:
 	bool wireframe = false;
 
 	VulkanglTFModel glTFModel;
+
+	vks::Texture2D fallbackTexAO;
+	vks::Texture2D fallbackexEmissive;
 
 	struct ShaderData {
 		vks::Buffer buffer;
@@ -509,6 +556,22 @@ public:
 		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.textures, nullptr);
 
 		shaderData.buffer.destroy();
+		destroyFallbackAssets();
+	}
+
+	void initFallbackAssets() {
+		uint32_t width = 2048, height = 2048;
+		std::vector<unsigned char> buffer(width * height * 4, 1);
+		VkDeviceSize bufferSize = static_cast<VkDeviceSize>(buffer.size());
+		fallbackTexAO.fromBuffer(buffer.data(), bufferSize, VK_FORMAT_R8G8B8A8_UNORM, width, height, vulkanDevice, queue);
+
+		buffer.resize(width * height * 4, 0);
+		fallbackexEmissive.fromBuffer(buffer.data(), bufferSize, VK_FORMAT_R8G8B8A8_UNORM, width, height, vulkanDevice, queue);
+	}
+
+	void destroyFallbackAssets() {
+		fallbackTexAO.destroy();
+		fallbackexEmissive.destroy();
 	}
 
 	virtual void getEnabledFeatures()
@@ -585,18 +648,12 @@ public:
 			glTFModel.loadTextures(glTFInput);
 			const tinygltf::Scene& scene = glTFInput.scenes[0];
 
-			glTFInput.buffers[0].uri;
-			glTFInput.bufferViews;
-
-			glTFInput.animations;
-
 			for (size_t i = 0; i < scene.nodes.size(); i++) {
 				const tinygltf::Node node = glTFInput.nodes[scene.nodes[i]];
 				auto nodeIdx = scene.nodes[i];
 
 				glTFModel.loadNode(node, nodeIdx, glTFInput, nullptr, indexBuffer, vertexBuffer);
 			}
-
 			
 		}
 		else {
@@ -610,8 +667,8 @@ public:
 
 				const auto& sampler = anim.samplers[channel.sampler];
 
-				const auto input_accessor = glTFInput.accessors[sampler.input];
-				const auto output_accessor = glTFInput.accessors[sampler.output];
+				const auto& input_accessor = glTFInput.accessors[sampler.input];
+				const auto& output_accessor = glTFInput.accessors[sampler.output];
 
 				const auto input_element_count = input_accessor.count;
 				const auto input_element_float_count = tinygltf::GetNumComponentsInType(input_accessor.type);
@@ -648,9 +705,8 @@ public:
 
 				auto run_animation = [=](float render_time) {
 
-					//if (render_time > input_max_value) { return; }
 					float current_t = fmod(render_time, input_max_value);
-					if (current_t < input_min_value) { return; }
+					if (current_t < input_min_value) { current_t = input_min_value; }
 
 					for(size_t i=0; i<_input_data_copy_.size()-1; ++i) {
 
@@ -820,7 +876,7 @@ public:
 		std::vector<VkDescriptorPoolSize> poolSizes = {
 			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1),
 			// One combined image sampler per model image/texture
-			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<uint32_t>(glTFModel.images.size())),
+			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<uint32_t>(glTFModel.images.size() * 5u)),
 		};
 		// One set for matrices and one per model image/texture
 		const uint32_t maxSetCount = static_cast<uint32_t>(glTFModel.images.size()) + 1;
@@ -831,14 +887,27 @@ public:
 		VkDescriptorSetLayoutBinding setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 0);
 		VkDescriptorSetLayoutCreateInfo descriptorSetLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(&setLayoutBinding, 1);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.matrices));
+
 		// Descriptor set layout for passing material textures
-		setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 0);
+		// setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 0);
+		// VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.textures));
+
+		std::vector<VkDescriptorSetLayoutBinding> texSetLayoutBindings = {
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 0), //albedo
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1), // normal
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 2), // metallic roughness
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 3), // AO
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 4), // emissive
+		};
+
+		descriptorSetLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(texSetLayoutBindings);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.textures));
+
 		// Pipeline layout using both descriptor sets (set 0 = matrices, set 1 = material)
 		std::array<VkDescriptorSetLayout, 2> setLayouts = { descriptorSetLayouts.matrices, descriptorSetLayouts.textures };
 		VkPipelineLayoutCreateInfo pipelineLayoutCI= vks::initializers::pipelineLayoutCreateInfo(setLayouts.data(), static_cast<uint32_t>(setLayouts.size()));
 		// We will use push constants to push the local matrices of a primitive to the vertex shader
-		VkPushConstantRange pushConstantRange = vks::initializers::pushConstantRange(VK_SHADER_STAGE_VERTEX_BIT, sizeof(glm::mat4), 0);
+		VkPushConstantRange pushConstantRange = vks::initializers::pushConstantRange(VK_SHADER_STAGE_VERTEX_BIT, 2 * sizeof(glm::mat4), 0);
 		// Push constant ranges are part of the pipeline layout
 		pipelineLayoutCI.pushConstantRangeCount = 1;
 		pipelineLayoutCI.pPushConstantRanges = &pushConstantRange;
@@ -849,21 +918,79 @@ public:
 		VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &descriptorSet));
 		VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(descriptorSet, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, &shaderData.buffer.descriptor);
 		vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+
 		// Descriptor sets for materials
-		for (auto& image : glTFModel.images) {
-			const VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.textures, 1);
-			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &image.descriptorSet));
-			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(image.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &image.texture.descriptor);
-			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+		allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.textures, 1);
+
+		for (auto& material : glTFModel.materials) {
+			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &material.descriptorSet));
+
+			std::array<VkDescriptorImageInfo*, 5> descriptorImageInfos{nullptr};
+			if (material.baseColorTextureIndex != -1) {
+				descriptorImageInfos[0] = &glTFModel.images[material.baseColorTextureIndex].texture.descriptor;
+			}
+			if (material.normalTexureIndex != -1) {
+				descriptorImageInfos[1] = &glTFModel.images[material.normalTexureIndex].texture.descriptor;
+			}
+
+			if (material.metallicRoughnessTextureIndex != -1) {
+				descriptorImageInfos[2] = &glTFModel.images[material.metallicRoughnessTextureIndex].texture.descriptor;
+			}
+
+			if (material.occlusionTextureIndex != -1) {
+				descriptorImageInfos[3] = &glTFModel.images[material.occlusionTextureIndex].texture.descriptor;
+			}else {
+				descriptorImageInfos[3] = &fallbackTexAO.descriptor;
+			}
+
+			if (material.emissiveTextureIndex != -1) {
+				descriptorImageInfos[4] = &glTFModel.images[material.emissiveTextureIndex].texture.descriptor;
+			} else {
+				descriptorImageInfos[4] = &fallbackexEmissive.descriptor;
+			}
+
+			//update each binding point about the material descri
+			std::vector<VkWriteDescriptorSet> writeDescriptorSets;
+			for (int i = 0; i < descriptorImageInfos.size(); ++i) {
+				if (descriptorImageInfos[i] != nullptr) {
+					VkWriteDescriptorSet w =  vks::initializers::writeDescriptorSet(material.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, i, descriptorImageInfos[i],  1);
+					writeDescriptorSets.emplace_back(w);
+				}
+			}
+
+			vkUpdateDescriptorSets(device, static_cast<uint32_t>(writeDescriptorSets.size()), writeDescriptorSets.data(),0 , nullptr);
 		}
+		
+		// for (auto& image : glTFModel.images) {
+		// 	const VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.textures, 1);
+		// 	VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &image.descriptorSet));
+		// 	VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(image.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &image.texture.descriptor);
+		// 	vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+		// }
 	}
 
 	void preparePipelines()
 	{
 		VkPipelineInputAssemblyStateCreateInfo inputAssemblyStateCI = vks::initializers::pipelineInputAssemblyStateCreateInfo(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_FALSE);
 		VkPipelineRasterizationStateCreateInfo rasterizationStateCI = vks::initializers::pipelineRasterizationStateCreateInfo(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0);
-		VkPipelineColorBlendAttachmentState blendAttachmentStateCI = vks::initializers::pipelineColorBlendAttachmentState(0xf, VK_FALSE);
+
+		auto colorMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+		VkPipelineColorBlendAttachmentState blendAttachmentStateCI = vks::initializers::pipelineColorBlendAttachmentState(colorMask, VK_TRUE);
+
+		blendAttachmentStateCI.blendEnable = VK_TRUE;
+		blendAttachmentStateCI.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+		blendAttachmentStateCI.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+		blendAttachmentStateCI.colorBlendOp = VK_BLEND_OP_ADD;
+		blendAttachmentStateCI.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+		blendAttachmentStateCI.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+		blendAttachmentStateCI.alphaBlendOp = VK_BLEND_OP_ADD;
+
 		VkPipelineColorBlendStateCreateInfo colorBlendStateCI = vks::initializers::pipelineColorBlendStateCreateInfo(1, &blendAttachmentStateCI);
+
+		//colorBlendStateCI.logicOpEnable = VK_TRUE;
+		//colorBlendStateCI.logicOp = VK_LOGIC_OP_COPY; // Optional
+
 		VkPipelineDepthStencilStateCreateInfo depthStencilStateCI = vks::initializers::pipelineDepthStencilStateCreateInfo(VK_TRUE, VK_TRUE, VK_COMPARE_OP_LESS_OR_EQUAL);
 		VkPipelineViewportStateCreateInfo viewportStateCI = vks::initializers::pipelineViewportStateCreateInfo(1, 1, 0);
 		VkPipelineMultisampleStateCreateInfo multisampleStateCI = vks::initializers::pipelineMultisampleStateCreateInfo(VK_SAMPLE_COUNT_1_BIT, 0);
@@ -875,9 +1002,10 @@ public:
 		};
 		const std::vector<VkVertexInputAttributeDescription> vertexInputAttributes = {
 			vks::initializers::vertexInputAttributeDescription(0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, pos)),	// Location 0: Position
-			vks::initializers::vertexInputAttributeDescription(0, 1, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, normal)),// Location 1: Normal
-			vks::initializers::vertexInputAttributeDescription(0, 2, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, uv)),	// Location 2: Texture coordinates
+			vks::initializers::vertexInputAttributeDescription(0, 1, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, normal)), // Location 1: Normal
+			vks::initializers::vertexInputAttributeDescription(0, 2, VK_FORMAT_R32G32_SFLOAT, offsetof(VulkanglTFModel::Vertex, uv)),	    // Location 2: UV 
 			vks::initializers::vertexInputAttributeDescription(0, 3, VK_FORMAT_R32G32B32_SFLOAT, offsetof(VulkanglTFModel::Vertex, color)),	// Location 3: Color
+			vks::initializers::vertexInputAttributeDescription(0, 4, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VulkanglTFModel::Vertex, tangent)) // Location 4 tangent
 		};
 		VkPipelineVertexInputStateCreateInfo vertexInputStateCI = vks::initializers::pipelineVertexInputStateCreateInfo();
 		vertexInputStateCI.vertexBindingDescriptionCount = static_cast<uint32_t>(vertexInputBindings.size());
@@ -941,6 +1069,7 @@ public:
 	{
 		VulkanExampleBase::prepare();
 		loadAssets();
+		initFallbackAssets();
 		prepareUniformBuffers();
 		setupDescriptors();
 		preparePipelines();
