@@ -14,9 +14,16 @@ layout (set = 0, binding = 0) uniform UBOScene
 	vec4 viewPos;
 } uboScene;
 
+layout (set = 2, binding = 0) readonly buffer _ModelMatrix {
+	mat4 _modelMatrix[];
+};
+
+layout (set = 2, binding = 1) readonly buffer _NormalMatrix {
+	mat4 _normalMatrix[];
+};
+
 layout(push_constant) uniform PushConsts {
-	mat4 modelMatrix;
-	mat4 normalMatrix;
+	uint nodeIndex;
 } primitive;
 
 layout (location = 0) out vec3 outNormal;
@@ -28,7 +35,8 @@ layout (location = 5) out vec4 outTangent;
 
 void main() 
 {
-	mat4 normal_matrix = primitive.normalMatrix; //transpose( inverse( primitive.model ) ); 
+	mat4 model_matrix = _modelMatrix[primitive.nodeIndex];
+	mat4 normal_matrix = _normalMatrix[primitive.nodeIndex]; //primitive.normalMatrix; //transpose( inverse( primitive.model ) ); 
 
 	outTangent = (normal_matrix * inTangent);
 	outTangent.w = inTangent.w;
@@ -36,7 +44,7 @@ void main()
 	outColor = inColor;
 	outUV = inUV;
 
-	vec4 pos_world = primitive.modelMatrix * vec4(inPos.xyz, 1.0f);
+	vec4 pos_world = model_matrix * vec4(inPos.xyz, 1.0f);
 	gl_Position = uboScene.projection * uboScene.view * pos_world;
 
 	vec4 normal_world = normal_matrix * vec4(inNormal, 0.0f);
